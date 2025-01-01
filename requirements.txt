@@ -1,0 +1,4 @@
+pillow
+accelerate
+tqdm
+transformers
