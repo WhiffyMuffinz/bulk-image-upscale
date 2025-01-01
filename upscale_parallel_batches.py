@@ -1,26 +1,27 @@
 """
 github.com/whiffymuffinz
-gpl license I guess.
+gplv3, I guess
 batches are handled incorrectly, but whatever
 """
 
-
+import os
 import random
 from concurrent.futures import ThreadPoolExecutor
-from transformers import pipeline
+
 import torch
 from PIL import Image
-import os
-from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.dataset import Subset
+from tqdm import tqdm
+from transformers import pipeline
 
 
 class ImageDataset(Dataset):
     def __init__(self, image_dir):
         self.image_paths = [
-            os.path.join(image_dir, fname) for fname in os.listdir(image_dir)
-            if fname.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))
+            os.path.join(image_dir, fname)
+            for fname in os.listdir(image_dir)
+            if fname.lower().endswith((".png", ".jpg", ".jpeg", ".bmp"))
         ]
 
     def __len__(self):
@@ -38,9 +39,11 @@ class ImageDataset(Dataset):
 
 def setup_pipelines(model_id="caidas/swin2SR-lightweight-x2-64"):
     pipelines = []
-    devices = [
-        f"cuda:{i}" for i in range(torch.cuda.device_count())
-    ] if torch.cuda.is_available() else ["cpu"]
+    devices = (
+        [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+        if torch.cuda.is_available()
+        else ["cpu"]
+    )
 
     for device in devices:
         try:
@@ -49,7 +52,7 @@ def setup_pipelines(model_id="caidas/swin2SR-lightweight-x2-64"):
                     "image-to-image",
                     model=model_id,
                     device=device,
-                    torch_dtype=torch.float16 if "cuda" in device else None
+                    torch_dtype=torch.float16 if "cuda" in device else None,
                 )
             )
         except Exception as e:
@@ -58,7 +61,7 @@ def setup_pipelines(model_id="caidas/swin2SR-lightweight-x2-64"):
     return pipelines
 
 
-def find_max_batch_size(pipe, test_image, min_size=0, max_size=100, method='binary'):
+def find_max_batch_size(pipe, test_image, min_size=0, max_size=100, method="binary"):
     """
     Find the maximum batch size that can fit in GPU memory using either linear or binary search.
 
@@ -72,6 +75,7 @@ def find_max_batch_size(pipe, test_image, min_size=0, max_size=100, method='bina
     Returns:
         int: Maximum batch size that fits in GPU memory
     """
+
     def test_batch_size(size):
         try:
             # Create a new batch of images
@@ -97,7 +101,7 @@ def find_max_batch_size(pipe, test_image, min_size=0, max_size=100, method='bina
                 return False
             raise
 
-    if method == 'linear':
+    if method == "linear":
         batch_size = max_size
         while batch_size > min_size:
             if test_batch_size(batch_size):
@@ -123,13 +127,14 @@ def find_max_batch_size(pipe, test_image, min_size=0, max_size=100, method='bina
 
         return best_size
 
+
 def collate_fn(batch):
     batch = [item for item in batch if item is not None]
     if not batch:
         return {"image": [], "path": []}
     return {
         "image": [item["image"] for item in batch],
-        "path": [item["path"] for item in batch]
+        "path": [item["path"] for item in batch],
     }
 
 
@@ -153,7 +158,9 @@ def process_images_on_device(device_index, subset, pipeline, batch_size, output_
                 Image.fromarray(output).save(output_path)
 
 
-def process_images_with_parallel_devices(image_dir, pipelines, batch_sizes, output_dir="./output"):
+def process_images_with_parallel_devices(
+    image_dir, pipelines, batch_sizes, output_dir="./output"
+):
     dataset = ImageDataset(image_dir)
     num_devices = len(pipelines)
     chunk_size = len(dataset) // num_devices
@@ -165,8 +172,7 @@ def process_images_with_parallel_devices(image_dir, pipelines, batch_sizes, outp
     # Handle leftover data by assigning it to the last subset
     if len(dataset) % num_devices > 0:
         subsets[-1] = Subset(
-            dataset,
-            range((num_devices - 1) * chunk_size, len(dataset))
+            dataset, range((num_devices - 1) * chunk_size, len(dataset))
         )
 
     with ThreadPoolExecutor(max_workers=num_devices) as executor:
@@ -177,7 +183,7 @@ def process_images_with_parallel_devices(image_dir, pipelines, batch_sizes, outp
                 subset=subsets[i],
                 pipeline=pipelines[i],
                 batch_size=batch_sizes[i],
-                output_dir=os.path.join(output_dir, f"device_{i}")
+                output_dir=os.path.join(output_dir, f"device_{i}"),
             )
             for i in range(num_devices)
         ]
@@ -200,12 +206,14 @@ if __name__ == "__main__":
     random_test_image = dataset[random_index]["image"]
 
     # Test batch size for each pipeline
-    batch_sizes = [find_max_batch_size(pipe, random_test_image,1, 11 ) for pipe in pipelines]
+    batch_sizes = [
+        find_max_batch_size(pipe, random_test_image, 1, 11) for pipe in pipelines
+    ]
 
     # Process images in parallel on all devices
     process_images_with_parallel_devices(
         image_dir=image_dir,
         pipelines=pipelines,
         batch_sizes=batch_sizes,
-        output_dir=output_dir
+        output_dir=output_dir,
     )
