@@ -10,8 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.dataset import Subset
+from torch.utils.data import Dataset
 from tqdm import tqdm
 from transformers import pipeline
 
@@ -64,36 +63,14 @@ def setup_pipelines(model_id="caidas/swin2SR-lightweight-x2-64"):
 def find_max_batch_size(pipe, test_image, min_size=0, max_size=100, method="binary"):
     """
     Find the maximum batch size that can fit in GPU memory using either linear or binary search.
-
-    Args:
-        pipe: The pipeline or model to test
-        test_image: A single test image to use for batch size testing
-        min_size: Minimum batch size to try (default: 0)
-        max_size: Maximum batch size to try (default: 100)
-        method: Search method - 'binary' or 'linear' (default: 'binary')
-
-    Returns:
-        int: Maximum batch size that fits in GPU memory
     """
 
     def test_batch_size(size):
         try:
-            # Create a new batch of images
-            # Each image should be loaded fresh to actually consume memory
-            batch_images = []
-            for _ in range(size):
-                # Here we load a fresh copy of the image instead of just referencing it
-                # Assuming test_image is a path or a function that loads an image
-                if isinstance(test_image, str):
-                    # If it's a path, load the image fresh each time
-                    img = Image.open(test_image)
-                else:
-                    # If it's a function or other loader, call it to get a fresh image
-                    img = test_image() if callable(test_image) else test_image.copy()
-                batch_images.append(img)
-            print("size: ", size)
-            # Test the batch
-            pipe(batch_images, batch_size=size)
+            # Create a batch of the same test image
+            batch = [test_image] * size
+            # Let pipeline handle the batching internally
+            pipe(batch, batch_size=size)
             return True
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
@@ -116,46 +93,38 @@ def find_max_batch_size(pipe, test_image, min_size=0, max_size=100, method="bina
 
         while left <= right:
             mid = (left + right) // 2
-
             if test_batch_size(mid):
-                # This size works, try a larger one
                 best_size = mid
                 left = mid + 1
             else:
-                # Too big, try a smaller size
                 right = mid - 1
 
         return best_size
 
 
-def collate_fn(batch):
-    batch = [item for item in batch if item is not None]
-    if not batch:
-        return {"image": [], "path": []}
-    return {
-        "image": [item["image"] for item in batch],
-        "path": [item["path"] for item in batch],
-    }
-
-
 def process_images_on_device(device_index, subset, pipeline, batch_size, output_dir):
-    dataloader = DataLoader(
-        subset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
-    )
     os.makedirs(output_dir, exist_ok=True)
 
-    for batch in tqdm(dataloader, desc=f"Device {device_index}"):
-        if not batch["image"]:
-            continue
+    # Filter out None values and prepare data
+    valid_items = [item for item in subset if item is not None]
+    if not valid_items:
+        return
 
-        outputs = pipeline(batch["image"], batch_size=len(batch["image"]))
+    images = [item["image"] for item in valid_items]
+    paths = [item["path"] for item in valid_items]
 
-        for path, output in zip(batch["path"], outputs):
-            output_path = os.path.join(output_dir, os.path.basename(path))
-            if isinstance(output, Image.Image):
-                output.save(output_path)
-            else:
-                Image.fromarray(output).save(output_path)
+    # Process all images, letting pipeline handle the batching
+    outputs = pipeline(images, batch_size=batch_size)
+
+    # Save outputs
+    for path, output in tqdm(
+        zip(paths, outputs), desc=f"Device {device_index}", total=len(paths)
+    ):
+        output_path = os.path.join(output_dir, os.path.basename(path))
+        if isinstance(output, Image.Image):
+            output.save(output_path)
+        else:
+            Image.fromarray(output).save(output_path)
 
 
 def process_images_with_parallel_devices(
@@ -164,26 +133,25 @@ def process_images_with_parallel_devices(
     dataset = ImageDataset(image_dir)
     num_devices = len(pipelines)
     chunk_size = len(dataset) // num_devices
-    subsets = [
-        Subset(dataset, range(i * chunk_size, (i + 1) * chunk_size))
-        for i in range(num_devices)
-    ]
 
-    # Handle leftover data by assigning it to the last subset
-    if len(dataset) % num_devices > 0:
-        subsets[-1] = Subset(
-            dataset, range((num_devices - 1) * chunk_size, len(dataset))
-        )
+    # Create subsets for each device
+    splits = []
+    for i in range(num_devices):
+        start_idx = i * chunk_size
+        end_idx = len(dataset) if i == num_devices - 1 else (i + 1) * chunk_size
+        device_data = [dataset[j] for j in range(start_idx, end_idx)]
+        splits.append(device_data)
 
+    # Process in parallel using ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=num_devices) as executor:
         futures = [
             executor.submit(
                 process_images_on_device,
                 device_index=i,
-                subset=subsets[i],
+                subset=splits[i],
                 pipeline=pipelines[i],
                 batch_size=batch_sizes[i],
-                output_dir=os.path.join(output_dir, f"device_{i}"),
+                output_dir=output_dir,
             )
             for i in range(num_devices)
         ]
@@ -207,7 +175,7 @@ if __name__ == "__main__":
 
     # Test batch size for each pipeline
     batch_sizes = [
-        find_max_batch_size(pipe, random_test_image, 1, 11) for pipe in pipelines
+        find_max_batch_size(pipe, random_test_image, 3, 3) for pipe in pipelines
     ]
 
     # Process images in parallel on all devices
