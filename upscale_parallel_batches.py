@@ -175,7 +175,7 @@ if __name__ == "__main__":
 
     # Test batch size for each pipeline
     batch_sizes = [
-        find_max_batch_size(pipe, random_test_image, 3, 3) for pipe in pipelines
+        find_max_batch_size(pipe, random_test_image, 1, 3) for pipe in pipelines
     ]
 
     # Process images in parallel on all devices
