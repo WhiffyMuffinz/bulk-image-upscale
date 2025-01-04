@@ -1,18 +1,18 @@
-"""
-github.com/whiffymuffinz
-gplv3, I guess
-batches are handled incorrectly, but whatever
-"""
-
 import os
 import random
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
+import logging
 from PIL import Image
 from torch.utils.data import Dataset
 from tqdm import tqdm
 from transformers import pipeline
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 
 class ImageDataset(Dataset):
@@ -32,7 +32,7 @@ class ImageDataset(Dataset):
             image = Image.open(img_path).convert("RGB")
             return {"image": image, "path": img_path}
         except Exception as e:
-            print(f"Error loading image {img_path}: {e}")
+            logging.error(f"Error loading image {img_path}: {e}")
             return None
 
 
@@ -46,6 +46,7 @@ def setup_pipelines(model_id="caidas/swin2SR-lightweight-x2-64"):
 
     for device in devices:
         try:
+            logging.info(f"Initializing pipeline on {device}")
             pipelines.append(
                 pipeline(
                     "image-to-image",
@@ -55,7 +56,7 @@ def setup_pipelines(model_id="caidas/swin2SR-lightweight-x2-64"):
                 )
             )
         except Exception as e:
-            print(f"Failed to initialize pipeline on {device}: {e}")
+            logging.error(f"Failed to initialize pipeline on {device}: {e}")
 
     return pipelines
 
@@ -121,43 +122,45 @@ def process_images_on_device(device_index, subset, pipeline, batch_size, output_
         zip(paths, outputs), desc=f"Device {device_index}", total=len(paths)
     ):
         output_path = os.path.join(output_dir, os.path.basename(path))
-        if isinstance(output, Image.Image):
-            output.save(output_path)
-        else:
-            Image.fromarray(output).save(output_path)
+        output.save(output_path)
+        logging.info(f"Saved processed image to {output_path}")
 
 
-def process_images_with_parallel_devices(
-    image_dir, pipelines, batch_sizes, output_dir="./output"
-):
+def process_images_with_parallel_devices(image_dir, pipelines, batch_sizes, output_dir):
+    # Load a random image from the dataset for testing
     dataset = ImageDataset(image_dir)
-    num_devices = len(pipelines)
-    chunk_size = len(dataset) // num_devices
+    if not dataset:
+        logging.error("No images found in the directory")
+        return
 
-    # Create subsets for each device
-    splits = []
-    for i in range(num_devices):
-        start_idx = i * chunk_size
-        end_idx = len(dataset) if i == num_devices - 1 else (i + 1) * chunk_size
-        device_data = [dataset[j] for j in range(start_idx, end_idx)]
-        splits.append(device_data)
+    random_test_image = dataset[random.randint(0, len(dataset) - 1)]["image"]
 
-    # Process in parallel using ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=num_devices) as executor:
-        futures = [
-            executor.submit(
-                process_images_on_device,
-                device_index=i,
-                subset=splits[i],
-                pipeline=pipelines[i],
-                batch_size=batch_sizes[i],
-                output_dir=output_dir,
-            )
-            for i in range(num_devices)
+    try:
+        # Test batch size for each pipeline
+        batch_sizes = [
+            find_max_batch_size(pipe, random_test_image, 1, 3) for pipe in pipelines
         ]
 
-        for future in tqdm(futures, desc="Overall Progress"):
-            future.result()
+        logging.info(f"Batch sizes found: {batch_sizes}")
+
+        # Process images in parallel on all devices
+        with ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(
+                    process_images_on_device,
+                    device_index=i,
+                    subset=dataset,
+                    pipeline=pipeline,
+                    batch_size=batch_size,
+                    output_dir=output_dir,
+                )
+                for i, (pipeline, batch_size) in enumerate(zip(pipelines, batch_sizes))
+            ]
+
+            for future in tqdm(futures, desc="Overall Progress"):
+                future.result()
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
 
 
 if __name__ == "__main__":
@@ -168,20 +171,10 @@ if __name__ == "__main__":
     # Setup pipelines for all available devices
     pipelines = setup_pipelines(model_id=model_id)
 
-    # Load a random image from the dataset for testing
-    dataset = ImageDataset(image_dir)
-    random_index = random.randint(0, len(dataset) - 1)
-    random_test_image = dataset[random_index]["image"]
+    if not pipelines:
+        logging.error("No pipelines configured. Exiting.")
+        exit(1)
 
-    # Test batch size for each pipeline
-    batch_sizes = [
-        find_max_batch_size(pipe, random_test_image, 1, 3) for pipe in pipelines
-    ]
-
-    # Process images in parallel on all devices
     process_images_with_parallel_devices(
-        image_dir=image_dir,
-        pipelines=pipelines,
-        batch_sizes=batch_sizes,
-        output_dir=output_dir,
+        image_dir=image_dir, pipelines=pipelines, batch_sizes=[], output_dir=output_dir
     )
