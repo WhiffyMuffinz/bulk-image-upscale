@@ -2,3 +2,4 @@ pillow
 accelerate
 tqdm
 transformers
+datasets

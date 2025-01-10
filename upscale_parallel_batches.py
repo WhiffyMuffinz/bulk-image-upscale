@@ -1,11 +1,11 @@
 import os
-import random
 from concurrent.futures import ThreadPoolExecutor
+import itertools
 
 import torch
 import logging
 from PIL import Image
-from torch.utils.data import Dataset
+from datasets import Dataset, IterableDataset
 from tqdm import tqdm
 from transformers import pipeline
 
@@ -14,26 +14,6 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-
-class ImageDataset(Dataset):
-    def __init__(self, image_dir):
-        self.image_paths = [
-            os.path.join(image_dir, fname)
-            for fname in os.listdir(image_dir)
-            if fname.lower().endswith((".png", ".jpg", ".jpeg", ".bmp"))
-        ]
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        try:
-            image = Image.open(img_path).convert("RGB")
-            return {"image": image, "path": img_path}
-        except Exception as e:
-            logging.error(f"Error loading image {img_path}: {e}")
-            return None
 
 
 def setup_pipelines(model_id="caidas/swin2SR-lightweight-x2-64"):
@@ -78,6 +58,9 @@ def find_max_batch_size(pipe, test_image, min_size=0, max_size=100, method="bina
                 torch.cuda.empty_cache()
                 return False
             raise
+    # do not batch on cpu
+    if pipe.model.device == torch.device("cpu"):
+        return 1
 
     if method == "linear":
         batch_size = max_size
@@ -114,31 +97,32 @@ def process_images_on_device(device_index, subset, pipeline, batch_size, output_
     images = [item["image"] for item in valid_items]
     paths = [item["path"] for item in valid_items]
 
-    # Process all images, letting pipeline handle the batching
-    outputs = pipeline(images, batch_size=batch_size)
-
-    # Save outputs
-    for path, output in tqdm(
-        zip(paths, outputs), desc=f"Device {device_index}", total=len(paths)
-    ):
+    # Process all images
+    for path, output in tqdm(zip(paths, pipeline(images, batch_size=batch_size)), desc=f"device: {pipeline.model.device}"):
         output_path = os.path.join(output_dir, os.path.basename(path))
         output.save(output_path)
         logging.info(f"Saved processed image to {output_path}")
 
 
+
 def process_images_with_parallel_devices(image_dir, pipelines, batch_sizes, output_dir):
     # Load a random image from the dataset for testing
-    dataset = ImageDataset(image_dir)
+    # dataset = ImageDataset(image_dir)
+    dataset = load_image_dataset(image_dir, streaming=True)
     if not dataset:
         logging.error("No images found in the directory")
         return
 
-    random_test_image = dataset[random.randint(0, len(dataset) - 1)]["image"]
+    dataset_iterator, peek_iterator = itertools.tee(iter(dataset))
+
+    # Peek at the first item
+    first_item = next(peek_iterator)
+    random_test_image = first_item["image"]
 
     try:
         # Test batch size for each pipeline
         batch_sizes = [
-            find_max_batch_size(pipe, random_test_image, 1, 3) for pipe in pipelines
+            find_max_batch_size(pipe, random_test_image, 1, 10) for pipe in pipelines
         ]
 
         logging.info(f"Batch sizes found: {batch_sizes}")
@@ -149,7 +133,7 @@ def process_images_with_parallel_devices(image_dir, pipelines, batch_sizes, outp
                 executor.submit(
                     process_images_on_device,
                     device_index=i,
-                    subset=dataset,
+                    subset=dataset_iterator,
                     pipeline=pipeline,
                     batch_size=batch_size,
                     output_dir=output_dir,
@@ -161,6 +145,29 @@ def process_images_with_parallel_devices(image_dir, pipelines, batch_sizes, outp
                 future.result()
     except Exception as e:
         logging.error(f"An error occurred: {e}")
+
+
+
+
+def load_image_dataset(image_dir, streaming=False):
+    def image_generator():
+        for fname in os.listdir(image_dir):
+            if fname.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
+                img_path = os.path.join(image_dir, fname)
+                try:
+                    image = Image.open(img_path).convert("RGB")
+                    yield {"image": image, "path": img_path}
+                except Exception as e:
+                    print(f"Error loading image {img_path}: {e}")
+
+    if streaming:
+        # Return an IterableDataset for streaming
+        return IterableDataset.from_generator(image_generator)
+    else:
+        # Load all data into memory for non-streaming mode
+        data = list(image_generator())
+        return Dataset.from_dict({"image": [x["image"] for x in data], "path": [x["path"] for x in data]})
+
 
 
 if __name__ == "__main__":
