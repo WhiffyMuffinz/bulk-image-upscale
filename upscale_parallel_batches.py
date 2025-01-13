@@ -11,9 +11,8 @@ from transformers import pipeline
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s"
 )
-
 
 
 def setup_pipelines(model_id="caidas/swin2SR-lightweight-x2-64"):
@@ -58,8 +57,10 @@ def find_max_batch_size(pipe, test_image, min_size=0, max_size=100, method="bina
                 torch.cuda.empty_cache()
                 return False
             raise
+
     # do not batch on cpu
     if pipe.model.device == torch.device("cpu"):
+        logging.warning("Using cpu. You probably don't want this.")
         return 1
 
     if method == "linear":
@@ -90,19 +91,23 @@ def process_images_on_device(device_index, subset, pipeline, batch_size, output_
     os.makedirs(output_dir, exist_ok=True)
 
     # Filter out None values and prepare data
+    logging.info("Validating data")
     valid_items = [item for item in subset if item is not None]
     if not valid_items:
         return
 
+    logging.debug("Reading images")
     images = [item["image"] for item in valid_items]
     paths = [item["path"] for item in valid_items]
 
     # Process all images
-    for path, output in tqdm(zip(paths, pipeline(images, batch_size=batch_size)), desc=f"device: {pipeline.model.device}"):
+    for path, output in tqdm(
+        zip(paths, pipeline(images, batch_size=batch_size)),
+        desc=f"device: {pipeline.model.device}",
+    ):
         output_path = os.path.join(output_dir, os.path.basename(path))
         output.save(output_path)
         logging.info(f"Saved processed image to {output_path}")
-
 
 
 def process_images_with_parallel_devices(image_dir, pipelines, batch_sizes, output_dir):
@@ -147,8 +152,6 @@ def process_images_with_parallel_devices(image_dir, pipelines, batch_sizes, outp
         logging.error(f"An error occurred: {e}")
 
 
-
-
 def load_image_dataset(image_dir, streaming=False):
     def image_generator():
         for fname in os.listdir(image_dir):
@@ -166,8 +169,9 @@ def load_image_dataset(image_dir, streaming=False):
     else:
         # Load all data into memory for non-streaming mode
         data = list(image_generator())
-        return Dataset.from_dict({"image": [x["image"] for x in data], "path": [x["path"] for x in data]})
-
+        return Dataset.from_dict(
+            {"image": [x["image"] for x in data], "path": [x["path"] for x in data]}
+        )
 
 
 if __name__ == "__main__":
