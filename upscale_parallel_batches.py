@@ -11,7 +11,7 @@ from transformers import pipeline
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 
@@ -87,27 +87,44 @@ def find_max_batch_size(pipe, test_image, min_size=0, max_size=100, method="bina
         return best_size
 
 
+def batch_iterator(iterable, batch_size):
+    """Yield batches from an iterable."""
+    iterator = iter(iterable)
+    while True:
+        batch = list(itertools.islice(iterator, batch_size))
+        if not batch:
+            break
+        yield batch
+
 def process_images_on_device(device_index, subset, pipeline, batch_size, output_dir):
     os.makedirs(output_dir, exist_ok=True)
-
-    # Filter out None values and prepare data
-    logging.info("Validating data")
-    valid_items = [item for item in subset if item is not None]
-    if not valid_items:
-        return
-
-    logging.debug("Reading images")
-    images = [item["image"] for item in valid_items]
-    paths = [item["path"] for item in valid_items]
-
-    # Process all images
-    for path, output in tqdm(
-        zip(paths, pipeline(images, batch_size=batch_size)),
-        desc=f"device: {pipeline.model.device}",
+    logging.info("Starting image processing pipeline")
+    
+    # Process in batches without materializing the full dataset
+    for batch in tqdm(
+        batch_iterator(subset, batch_size),
+        desc=f"device: {pipeline.model.device}"
     ):
-        output_path = os.path.join(output_dir, os.path.basename(path))
-        output.save(output_path)
-        logging.info(f"Saved processed image to {output_path}")
+        # Extract images and paths for current batch
+        batch_images = [item["image"] for item in batch]
+        batch_paths = [item["path"] for item in batch]
+        
+        # Process batch
+        try:
+            outputs = pipeline(batch_images, batch_size=len(batch_images))
+            
+            # Save processed images
+            for path, output in zip(batch_paths, outputs):
+                output_path = os.path.join(output_dir, os.path.basename(path))
+                try:
+                    output.save(output_path)
+                    logging.debug(f"Saved processed image to {output_path}")
+                except Exception as e:
+                    logging.error(f"Failed to save image {path}: {str(e)}")
+                    
+        except Exception as e:
+            logging.error(f"Failed to process batch: {str(e)}")
+            continue
 
 
 def process_images_with_parallel_devices(image_dir, pipelines, batch_sizes, output_dir):
@@ -118,11 +135,13 @@ def process_images_with_parallel_devices(image_dir, pipelines, batch_sizes, outp
         logging.error("No images found in the directory")
         return
 
-    dataset_iterator, peek_iterator = itertools.tee(iter(dataset))
-
-    # Peek at the first item
-    first_item = next(peek_iterator)
+    # Get the first image for batch size testing
+    dataset_iterator = iter(dataset)
+    first_item = next(dataset_iterator)
     random_test_image = first_item["image"]
+
+    # Create a new iterator that includes the first item
+    dataset_iterator = itertools.chain([first_item], dataset_iterator)
 
     try:
         # Test batch size for each pipeline
