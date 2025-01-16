@@ -1,4 +1,5 @@
 import os
+import queue
 from concurrent.futures import ThreadPoolExecutor
 import itertools
 
@@ -13,6 +14,28 @@ from transformers import pipeline
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
+
+
+def producer(image_dir, image_queue, batch_size):
+    """producer class for a shared queue"""
+    dataset = load_image_dataset(image_dir, streaming=True)
+    dataset_iterator = iter(dataset)
+
+    for batch in batch_iterator(dataset_iterator, batch_size):
+        image_queue.put(batch)
+
+    # Signal the consumers to finish
+    for _ in range(len(pipelines)):
+        image_queue.put(None)
+
+
+def consumer(pipeline, image_queue, output_dir):
+    """consumer class for a shared queue"""
+    while True:
+        batch = image_queue.get()
+        if batch is None:
+            break
+        process_images_on_device(batch, pipeline, output_dir)
 
 
 def setup_pipelines(model_id="caidas/swin2SR-lightweight-x2-64"):
@@ -96,23 +119,23 @@ def batch_iterator(iterable, batch_size):
             break
         yield batch
 
+
 def process_images_on_device(device_index, subset, pipeline, batch_size, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     logging.info("Starting image processing pipeline")
-    
+
     # Process in batches without materializing the full dataset
     for batch in tqdm(
-        batch_iterator(subset, batch_size),
-        desc=f"device: {pipeline.model.device}"
+        batch_iterator(subset, batch_size), desc=f"device: {pipeline.model.device}"
     ):
         # Extract images and paths for current batch
         batch_images = [item["image"] for item in batch]
         batch_paths = [item["path"] for item in batch]
-        
+
         # Process batch
         try:
             outputs = pipeline(batch_images, batch_size=len(batch_images))
-            
+
             # Save processed images
             for path, output in zip(batch_paths, outputs):
                 output_path = os.path.join(output_dir, os.path.basename(path))
@@ -121,7 +144,7 @@ def process_images_on_device(device_index, subset, pipeline, batch_size, output_
                     logging.debug(f"Saved processed image to {output_path}")
                 except Exception as e:
                     logging.error(f"Failed to save image {path}: {str(e)}")
-                    
+
         except Exception as e:
             logging.error(f"Failed to process batch: {str(e)}")
             continue
