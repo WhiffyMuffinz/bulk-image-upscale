@@ -3,3 +3,4 @@ accelerate
 tqdm
 transformers
 datasets
+huggingface_hub[cli, hf_transfer]
