@@ -75,7 +75,7 @@ def consumer(pipeline, image_queue, output_dir, batch_size):
             flag = False
             batch = []
 
-            for _ in batch_size:
+            for _ in range(batch_size):
                 image = image_queue.get(timeout=60)
                 if image is None:
                     logging.info(f"Consumer on {device_name} received shutdown signal")
