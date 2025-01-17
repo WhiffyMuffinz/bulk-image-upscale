@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 
 
-def producer(image_dir, image_queue, batch_size):
+def producer(image_dir, image_queue):
     """
     Produces batches of images and puts them in the shared queue.
 
@@ -72,13 +72,14 @@ def consumer(pipeline, image_queue, output_dir, batch_size):
 
     while True:
         try:
-
+            flag = False
             batch = []
 
-            for i in batch_size:
+            for _ in batch_size:
                 image = image_queue.get(timeout=60)
                 if image is None:
                     logging.info(f"Consumer on {device_name} received shutdown signal")
+                    flag = True
                     break
                 batch.append(image_queue.get(timeout=60))  # 60 second timeout
 
@@ -90,7 +91,7 @@ def consumer(pipeline, image_queue, output_dir, batch_size):
                 f"Consumer on {device_name} received batch: len:{len(batch_images)} "
             )
 
-            outputs = pipeline(batch_images)
+            outputs = pipeline(batch_images, batch_size=batch_size)
 
             # Save processed images
             for path, output in zip(batch_paths, outputs):
@@ -100,7 +101,8 @@ def consumer(pipeline, image_queue, output_dir, batch_size):
                     logging.debug(f"Saved processed image to {output_path}")
                 except Exception as e:
                     logging.error(f"Failed to save image {path}: {str(e)}")
-
+            if flag == True:
+                break
         except queue.Empty:
             logging.warning(f"Queue timeout on {device_name}")
             continue
@@ -155,18 +157,21 @@ def process_images_with_queue(
     # Find optimal batch size using the first pipeline
     dataset = load_image_dataset(image_dir, streaming=True)
     first_item = next(iter(dataset))
-    batch_size = find_max_batch_size(pipelines[0], first_item["image"], 1, 100)
-    logging.info(f"Using batch size: {batch_size}")
+    batch_sizes = [
+        find_max_batch_size(pipeline, first_item["image"], 1, 100)
+        for pipeline in pipelines
+    ]
+    logging.info(f"Using batch sizes: {batch_sizes}")
 
     # Start producer thread
-    producer_thread = threading.Thread(
-        target=producer, args=(image_dir, image_queue, batch_size)
-    )
+    producer_thread = threading.Thread(target=producer, args=(image_dir, image_queue))
 
     # Start consumer threads
     consumer_threads = []
-    for pipe in pipelines:
-        thread = threading.Thread(target=consumer, args=(pipe, image_queue, output_dir))
+    for pipe, batch_size in zip(pipelines, batch_sizes):
+        thread = threading.Thread(
+            target=consumer, args=(pipe, image_queue, output_dir, batch_size)
+        )
         consumer_threads.append(thread)
 
     # Start all threads
