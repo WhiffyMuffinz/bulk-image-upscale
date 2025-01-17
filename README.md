@@ -16,7 +16,7 @@ pip install torch torchvision torchaudio
 # install project specific requirements
 pip install -r requirements.txt
 # run the thing
-python ./upscale_parallel_batches.py
+python ./upscale_sahred_queue.py
 ```
 
 The current iteration of this code expects input images to be in a folder called `input`, and outputs upscaled images in the `output` directory.
