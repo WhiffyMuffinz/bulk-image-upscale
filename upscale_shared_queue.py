@@ -40,7 +40,7 @@ def producer(image_dir, image_queue):
     dataset_iterator = iter(dataset)
 
     try:
-        for image in dataset_iterator:
+        for image in tqdm(dataset_iterator, desc="items in queue:"):
             image_queue.put(image)
     except Exception as e:
         logging.error(f"Producer error: {e}")
@@ -75,7 +75,8 @@ def consumer(pipeline, image_queue, output_dir, batch_size):
             flag = False
             batch = []
 
-            for _ in range(batch_size):
+            for _ in range(10 * batch_size):
+                # accumulate 10 batches for less spikey gpu behavior
                 image = image_queue.get(timeout=60)
                 if image is None:
                     logging.info(f"Consumer on {device_name} received shutdown signal")
@@ -87,9 +88,9 @@ def consumer(pipeline, image_queue, output_dir, batch_size):
             batch_images = [item["image"] for item in batch]
             batch_paths = [item["path"] for item in batch]
 
-            logging.info(
-                f"Consumer on {device_name} received batch: len:{len(batch_images)} "
-            )
+            # logging.info(
+            # f"Consumer on {device_name} received batch: len:{len(batch_images)} "
+            # )
 
             outputs = pipeline(batch_images, batch_size=batch_size)
 
