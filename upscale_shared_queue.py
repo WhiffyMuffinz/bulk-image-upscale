@@ -40,7 +40,7 @@ def producer(image_dir, image_queue):
     dataset_iterator = iter(dataset)
 
     try:
-        for image in tqdm(dataset_iterator, desc="items in queue:"):
+        for image in tqdm(dataset_iterator, desc="items entered queue"):
             image_queue.put(image)
     except Exception as e:
         logging.error(f"Producer error: {e}")
@@ -88,13 +88,14 @@ def consumer(pipeline, image_queue, output_dir, batch_size):
             batch_images = [item["image"] for item in batch]
             batch_paths = [item["path"] for item in batch]
 
-            # logging.info(
-            # f"Consumer on {device_name} received batch: len:{len(batch_images)} "
-            # )
+            logging.info(
+                f"Consumer on {device_name} received batch: len:{len(batch_images)} "
+            )
 
             outputs = pipeline(batch_images, batch_size=batch_size)
 
             # Save processed images
+            logging.info(f"Consumer on {device_name} saving batch")
             for path, output in zip(batch_paths, outputs):
                 output_path = os.path.join(output_dir, os.path.basename(path))
                 try:
@@ -192,4 +193,6 @@ if __name__ == "__main__":
     image_dir = "./input"
     output_dir = "./output"
 
-    process_images_with_queue(image_dir=image_dir, output_dir=output_dir)
+    process_images_with_queue(
+        image_dir=image_dir, output_dir=output_dir, queue_size=1000
+    )
