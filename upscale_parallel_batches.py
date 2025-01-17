@@ -39,6 +39,36 @@ def consumer(pipeline, image_queue, output_dir):
 
 
 def setup_pipelines(model_id="caidas/swin2SR-lightweight-x2-64"):
+    """
+    Set up and initialize image-to-image pipelines on available devices.
+
+    This function initializes image-to-image pipelines using the specified model ID
+    on all available GPU devices. If no GPUs are available, it initializes the pipeline
+    on the CPU. It handles exceptions during the initialization process and logs errors.
+    Each pipeline is configured to use the appropriate data type (float16 for GPU and float32 for CPU).
+
+    Parameters:
+    ----------
+    model_id : str, optional
+        The ID of the model to be used for the image-to-image pipeline.
+        Defaults to "caidas/swin2SR-lightweight-x2-64".
+
+    Returns:
+    -------
+    list
+        A list of initialized pipeline objects, each associated with a device.
+        If no devices are available or initialization fails for all devices, the list will be empty.
+
+    Notes:
+    -----
+    - This function is used within the `process_images_with_parallel_devices` function to initialize
+      pipelines for parallel image processing.
+    - The function logs an informational message for each pipeline initialization attempt and an error
+      message if an exception occurs.
+    - The pipelines are configured to use float16 precision on GPU devices to reduce memory usage and
+      potentially improve performance.
+    - If no GPUs are available, the pipeline is initialized on the CPU using float32 precision.
+    """
     pipelines = []
     devices = (
         [f"cuda:{i}" for i in range(torch.cuda.device_count())]
@@ -65,7 +95,50 @@ def setup_pipelines(model_id="caidas/swin2SR-lightweight-x2-64"):
 
 def find_max_batch_size(pipe, test_image, min_size=0, max_size=100, method="binary"):
     """
-    Find the maximum batch size that can fit in GPU memory using either linear or binary search.
+    Determine the maximum batch size that can fit in GPU memory without causing an out-of-memory error.
+    This function uses either a linear or binary search method to find the optimal batch size for
+    the given image-to-image pipeline.
+
+    Parameters:
+    ----------
+    pipe : transformers.pipelines.Pipeline
+        The image-to-image pipeline that processes the batch of images.
+        This pipeline should be initialized with a model and a specific device.
+    test_image : PIL.Image.Image
+        A single test image to be used for determining the maximum batch size.
+        This image will be replicated to form batches of varying sizes.
+    min_size : int, optional
+        The minimum batch size to test. Default is 0.
+        The function will not test batch sizes smaller than this value.
+    max_size : int, optional
+        The maximum batch size to test. Default is 100.
+        The function will not test batch sizes larger than this value.
+    method : str, optional
+        The search method to use for finding the maximum batch size.
+        Options are "linear" or "binary". Default is "binary".
+
+    Returns:
+    -------
+    int
+        The maximum batch size that can fit in GPU memory without causing an out-of-memory error.
+        If no valid batch size is found within the specified range, it returns the `min_size`.
+
+    Raises:
+    ------
+    RuntimeError
+        If an error other than an out-of-memory error occurs during testing.
+
+    Notes:
+    -----
+    - This function is used within the `process_images_with_parallel_devices` function to determine
+      the optimal batch size for each pipeline before processing the images in parallel.
+    - The function assumes that the `pipe` function handles batching internally and can process a list of images.
+    - The function logs a warning if the device is set to CPU, as batching on CPU is generally not recommended.
+    - The function uses binary search by default, which is more efficient than linear search for large ranges.
+    - If the `pipe` function raises a `RuntimeError` that contains "out of memory" in its message, the function
+      clears the GPU cache and continues searching.
+    - The `test_image` is obtained from the first image in the dataset loaded by `load_image_dataset`.
+    - The determined batch sizes are used in the `process_images_on_device` function to process images in batches.
     """
 
     def test_batch_size(size):
@@ -111,7 +184,25 @@ def find_max_batch_size(pipe, test_image, min_size=0, max_size=100, method="bina
 
 
 def batch_iterator(iterable, batch_size):
-    """Yield batches from an iterable."""
+    """
+    Yield batches of a specified size from an iterable.
+
+    This function takes an iterable and a batch size as input and yields
+    batches of the specified size. If the number of elements in the iterable
+    is not a perfect multiple of the batch size, the last batch will contain
+    the remaining elements.
+
+    Parameters:
+    iterable (iterable): The iterable from which to yield batches.
+    batch_size (int): The size of each batch. Must be a positive integer.
+
+    Yields:
+    list: A list containing elements from the iterable, up to `batch_size` elements.
+
+    Example:
+    >>> list(batch_iterator([1, 2, 3, 4, 5, 6, 7], 3))
+    [[1, 2, 3], [4, 5, 6], [7]]
+    """
     iterator = iter(iterable)
     while True:
         batch = list(itertools.islice(iterator, batch_size))
@@ -121,12 +212,45 @@ def batch_iterator(iterable, batch_size):
 
 
 def process_images_on_device(device_index, subset, pipeline, batch_size, output_dir):
+    """
+    Process images on a specified device using an image-to-image pipeline and save the processed images.
+
+    This function takes a subset of images, processes them in batches using the provided image-to-image
+    pipeline, and saves the processed images to the specified output directory. It handles exceptions
+    during the processing and saving of images and logs appropriate messages.
+
+    Parameters:
+    ----------
+    device_index : int
+        The index of the device on which the pipeline is running. This is mainly used for logging purposes.
+    subset : iterable
+        An iterable of image data, where each item is a dictionary containing the image and its path.
+    pipeline : transformers.pipelines.Pipeline
+        The image-to-image pipeline used to process the images.
+    batch_size : int
+        The size of each batch to process. Images are processed in batches to optimize memory usage.
+    output_dir : str
+        The directory where the processed images will be saved.
+
+    Returns:
+    -------
+    None
+
+    Notes:
+    -----
+    - The function ensures that the output directory exists before saving images.
+    - It uses the `tqdm` library to provide a progress bar for batch processing.
+    - The function logs informational messages at the start of the processing and debug messages upon
+      successful saving of each processed image.
+    - It handles exceptions during the loading and saving of images, logging error messages if any occur.
+    - The function processes images in batches to avoid loading the entire dataset into memory at once.
+    """
     os.makedirs(output_dir, exist_ok=True)
     logging.info("Starting image processing pipeline")
 
     # Process in batches without materializing the full dataset
     for batch in tqdm(
-        batch_iterator(subset, batch_size), desc=f"device: {pipeline.model.device}"
+        batch_iterator(subset, 50 * batch_size), desc=f"device: {pipeline.model.device}"
     ):
         # Extract images and paths for current batch
         batch_images = [item["image"] for item in batch]
@@ -134,7 +258,7 @@ def process_images_on_device(device_index, subset, pipeline, batch_size, output_
 
         # Process batch
         try:
-            outputs = pipeline(batch_images, batch_size=len(batch_images))
+            outputs = pipeline(batch_images, batch_size=batch_size)
 
             # Save processed images
             for path, output in zip(batch_paths, outputs):
@@ -151,8 +275,40 @@ def process_images_on_device(device_index, subset, pipeline, batch_size, output_
 
 
 def process_images_with_parallel_devices(image_dir, pipelines, batch_sizes, output_dir):
-    # Load a random image from the dataset for testing
-    # dataset = ImageDataset(image_dir)
+    """
+    Process images from a specified directory using multiple image-to-image pipelines in parallel.
+    This function determines the optimal batch size for each pipeline, processes the images in batches,
+    and saves the processed images to the specified output directory.
+
+    Parameters:
+    ----------
+    image_dir : str
+        The directory containing the input images to be processed.
+    pipelines : list of transformers.pipelines.Pipeline
+        A list of initialized image-to-image pipelines, each associated with a device.
+        These pipelines will be used to process the images in parallel.
+    batch_sizes : list of int
+        A list of batch sizes corresponding to each pipeline. This parameter is currently
+        not used directly in the function, but can be used to pass pre-determined batch sizes.
+        If an empty list is provided, the function will determine the batch sizes internally.
+    output_dir : str
+        The directory where the processed images will be saved.
+
+    Returns:
+    -------
+    None
+
+    Notes:
+    -----
+    - The function loads an image from the dataset for testing batch sizes.
+    - It determines the maximum batch size for each pipeline using the `find_max_batch_size` function.
+    - The function uses a `ThreadPoolExecutor` to process images in parallel on all available devices.
+    - The images are processed in batches to optimize memory usage, and the batch size is determined dynamically
+      based on the available GPU memory.
+    - The function handles exceptions during image processing and saving, logging appropriate messages.
+    - The `batch_sizes` parameter is currently not used in the function and is provided for future use or flexibility.
+    """
+    # Load an image from the dataset for testing
     dataset = load_image_dataset(image_dir, streaming=True)
     if not dataset:
         logging.error("No images found in the directory")
@@ -195,6 +351,42 @@ def process_images_with_parallel_devices(image_dir, pipelines, batch_sizes, outp
 
 
 def load_image_dataset(image_dir, streaming=False):
+    """
+    Load images from a specified directory into a dataset, either as a streaming dataset or a fully loaded dataset.
+
+    This function scans the specified directory for image files (with extensions .png, .jpg, .jpeg, .bmp),
+    loads them into memory, and returns a dataset object. The dataset can be returned as a streaming dataset
+    (using `IterableDataset`) or as a fully loaded dataset (using `Dataset`), depending on the `streaming` parameter.
+
+    Parameters:
+    ----------
+    image_dir : str
+        The directory containing the image files to be loaded.
+    streaming : bool, optional
+        If `True`, the function returns an `IterableDataset` that streams images one by one.
+        If `False`, the function loads all images into memory and returns a `Dataset`.
+        Default is `False`.
+
+    Returns:
+    -------
+    dataset : Dataset or IterableDataset
+        If `streaming` is `True`, returns an `IterableDataset` for streaming images.
+        If `streaming` is `False`, returns a `Dataset` containing all images loaded into memory.
+
+    Raises:
+    ------
+    FileNotFoundError
+        If the specified `image_dir` does not exist or is not a directory.
+
+    Notes:
+    -----
+    - The function converts each loaded image to RGB format to ensure consistency.
+    - Errors encountered while loading individual images are caught and logged, but do not halt the loading process.
+    - The function is used in the `process_images_with_parallel_devices` function to load images for processing.
+    - In streaming mode, the dataset is generated on-the-fly, which is memory efficient for large datasets.
+    - In non-streaming mode, all images are loaded into memory at once, which can be faster for small to medium-sized datasets.
+    """
+
     def image_generator():
         for fname in os.listdir(image_dir):
             if fname.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
