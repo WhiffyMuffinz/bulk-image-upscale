@@ -82,7 +82,7 @@ def consumer(pipeline, image_queue, output_dir, batch_size):
                     logging.info(f"Consumer on {device_name} received shutdown signal")
                     flag = True
                     break
-                batch.append(image_queue.get(timeout=60))  # 60 second timeout
+                batch.append(image)  # 60 second timeout
 
             # Process the batch
             batch_images = [item["image"] for item in batch]
@@ -160,8 +160,8 @@ def process_images_with_queue(
     dataset = load_image_dataset(image_dir, streaming=True)
     first_item = next(iter(dataset))
     batch_sizes = [
-        find_max_batch_size(pipeline, first_item["image"], 1, 100)
-        for pipeline in pipelines
+        find_max_batch_size(pipeline, first_item["image"], 1, 5)
+        for pipeline in tqdm(pipelines, desc="finding batch sizes")
     ]
     logging.info(f"Using batch sizes: {batch_sizes}")
 
