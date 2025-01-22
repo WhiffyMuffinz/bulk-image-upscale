@@ -1,21 +1,17 @@
+import logging
 import os
 import queue
-from concurrent.futures import ThreadPoolExecutor
-import itertools
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
-import logging
-from PIL import Image
 from datasets import Dataset, IterableDataset
+from PIL import Image
 from tqdm import tqdm
 from transformers import pipeline
 
-from upscale_parallel_batches import (
-    load_image_dataset,
-    find_max_batch_size,
-    batch_iterator,
-)
+from async_image_saver import async_image_saver
+from upscale_parallel_batches import find_max_batch_size, load_image_dataset
 
 # Configure logging
 logging.basicConfig(
@@ -50,7 +46,7 @@ def producer(image_dir, image_queue):
             image_queue.put(None)
 
 
-def consumer(pipeline, image_queue, output_dir, batch_size):
+def consumer(pipeline, image_queue, output_dir, batch_size, saver: async_image_saver):
     """
     Consumes image batches from the queue and processes them using the given pipeline.
 
@@ -99,7 +95,7 @@ def consumer(pipeline, image_queue, output_dir, batch_size):
             for path, output in zip(batch_paths, outputs):
                 output_path = os.path.join(output_dir, os.path.basename(path))
                 try:
-                    output.save(output_path)
+                    saver.save(output, output_path)
                     logging.debug(f"Saved processed image to {output_path}")
                 except Exception as e:
                     logging.error(f"Failed to save image {path}: {str(e)}")
@@ -165,14 +161,18 @@ def process_images_with_queue(
     ]
     logging.info(f"Using batch sizes: {batch_sizes}")
 
+    logging.info(f"Iitializing saver thread")
+    saver = async_image_saver(output_dir)
     # Start producer thread
+    logging.info(f"Initializing producer thread")
     producer_thread = threading.Thread(target=producer, args=(image_dir, image_queue))
 
+    logging.info(f"Initializing consumer threads")
     # Start consumer threads
     consumer_threads = []
     for pipe, batch_size in zip(pipelines, batch_sizes):
         thread = threading.Thread(
-            target=consumer, args=(pipe, image_queue, output_dir, batch_size)
+            target=consumer, args=(pipe, image_queue, output_dir, batch_size, saver)
         )
         consumer_threads.append(thread)
 
@@ -185,6 +185,8 @@ def process_images_with_queue(
     producer_thread.join()
     for thread in consumer_threads:
         thread.join()
+
+    saver.shutdown()
 
     logging.info("Image processing completed")
 
