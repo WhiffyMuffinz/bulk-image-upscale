@@ -12,7 +12,7 @@ cd bulk-image-upscale
 python -m venv venv
 source venv/bin/activate
 # install pytorch. this works for most users
-pip install torch torchvision torchaudio
+pip install torch
 # install project specific requirements
 pip install -r requirements.txt
 # run the thing
