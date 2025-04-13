@@ -1,7 +1,7 @@
 import os
+import logging
 
 import torch
-import logging
 from PIL import Image
 from datasets import Dataset, IterableDataset
 

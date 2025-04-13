@@ -1,3 +1,7 @@
+"""
+Asynchronous image saver class. Worker thread has a buffer that saves frames to a given path.
+"""
+
 import logging
 import multiprocessing as mp
 from queue import Empty
