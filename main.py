@@ -13,6 +13,8 @@ from tqdm import tqdm
 from transformers import pipeline
 
 from async_image_saver import async_image_saver
+from tile_cache import RunLocalTileCache
+from tiled_processor import TiledBatchProcessor
 from utils import find_max_batch_size, load_image_dataset
 
 # Configure logging
@@ -31,8 +33,6 @@ def producer(image_dir, image_queue):
         Directory containing input images
     image_queue : queue.Queue
         Shared queue for image batches
-    batch_size : int
-        Size of image batches to create
     """
     dataset = load_image_dataset(image_dir, streaming=True)
     dataset_iterator = iter(dataset)
@@ -48,7 +48,14 @@ def producer(image_dir, image_queue):
             image_queue.put(None)
 
 
-def consumer(pipeline, image_queue, output_dir, batch_size, saver: async_image_saver):
+def consumer(
+    pipeline,
+    image_queue,
+    output_dir,
+    batch_size,
+    saver: async_image_saver,
+    cache: RunLocalTileCache,
+):
     """
     Consumes image batches from the queue and processes them using the given pipeline.
     Implements OOM recovery by splitting failed batches into smaller chunks.
@@ -65,6 +72,8 @@ def consumer(pipeline, image_queue, output_dir, batch_size, saver: async_image_s
         Starting batch size for this consumer
     saver : async_image_saver
         Async image saver instance
+    cache : RunLocalTileCache
+        Shared tile cache for deduplication
     """
     device_index = (
         pipeline.model.device.index if hasattr(pipeline.model.device, "index") else -1
@@ -73,119 +82,90 @@ def consumer(pipeline, image_queue, output_dir, batch_size, saver: async_image_s
         torch.cuda.get_device_name(device_index) if device_index != -1 else "CPU"
     )
 
+    # Initialize tiled processor
+    # Note: batch_size here refers to the number of images we pull from the queue.
+    # storage_batch_size used by processor for internal tile batches can be fixed or related.
+    # Since tiles are small (128x128), we can use a decent batch size for inference.
+    processor = TiledBatchProcessor(
+        pipeline=pipeline, cache=cache, batch_size=32  # Good default for tiles
+    )
+
     while True:
         try:
             shutdown_flag = False
             batch = []
 
             # Accumulate a batch of images with timeout
-            for _ in range(batch_size * 10):  # Adjust multiplier as needed
-                image = image_queue.get(timeout=60)
-                if image is None:
-                    logging.info(f"Consumer on {device_name} received shutdown signal")
-                    shutdown_flag = True
+            # For tiled processing, we can process fewer images at once if they are large,
+            # but 'batch_size' was calculated for whole images.
+            # We stick to the passed batch_size for queue consumption.
+            for _ in range(batch_size):
+                try:
+                    image = image_queue.get(timeout=5)
+                    if image is None:
+                        logging.info(
+                            f"Consumer on {device_name} received shutdown signal"
+                        )
+                        shutdown_flag = True
+                        break
+                    batch.append(image)
+                except queue.Empty:
                     break
-                batch.append(image)
+
+            if not batch and not shutdown_flag:
+                # Queue empty but no shutdown yet, wait a bit
+                continue
+
+            # Process what we have
+            if batch:
+                # Extract batch data
+                batch_images = [item["image"] for item in batch]
+                batch_paths = [item["path"] for item in batch]
+                logging.info(
+                    f"Consumer on {device_name} processing batch of {len(batch_images)} "
+                    f"images"
+                )
+
+                try:
+                    # Process batch using tiled processor
+                    # Tiled processor handles internal OOM recovery for tile batches?
+                    # The current implementation of TiledBatchProcessor processes tiles in chunks.
+                    # It doesn't have the sophisticated recursive OOM recovery of the old consumer,
+                    # but since tiles are small and uniform, OOM is much less likely/predictable.
+                    outputs = processor.process_batch(batch_images)
+                    processed_successfully = True
+
+                    # Save processed images
+                    logging.info(
+                        f"Saving {len(outputs)} processed images from {device_name}"
+                    )
+                    for path, output in zip(batch_paths, outputs):
+                        output_path = os.path.join(output_dir, os.path.basename(path))
+                        try:
+                            saver.save(output, output_path)
+                        except Exception as e:
+                            logging.error(f"Failed to save image {path}: {str(e)}")
+
+                except Exception as e:
+                    logging.error(f"Error processing batch on {device_name}: {e}")
+                    # If TiledBatchProcessor fails, we lose this batch.
+                    # Implementing retry logic for tiled processor is complex due to cache state.
+                    # For now, we log and continue.
+
+                finally:
+                    # Mark tasks as done
+                    for _ in batch:
+                        image_queue.task_done()
 
             # Exit if shutdown signal received
             if shutdown_flag:
+                # Mark the None task as done
+                image_queue.task_done()
                 break
 
-            # Extract batch data
-            batch_images = [item["image"] for item in batch]
-            batch_paths = [item["path"] for item in batch]
-            logging.info(
-                f"Consumer on {device_name} processing batch of {len(batch_images)} "
-                f"images (batch_size={batch_size})"
-            )
-
-            # Initialize variables for batch processing
-            outputs = None
-            processed_successfully = False
-
-            try:
-                # Attempt to process the full batch
-                outputs = pipeline(batch_images, batch_size=batch_size)
-                processed_successfully = True
-                logging.info(f"Successfully processed batch on {device_name}")
-
-            except torch.cuda.OutOfMemoryError as oom_error:
-                logging.error(
-                    f"OOM Error on {device_name} with batch size {batch_size} "
-                    f"for {len(batch_images)} images: {oom_error}"
-                )
-                torch.cuda.empty_cache()
-
-                # If batch contains single image and still OOMs, skip it
-                if len(batch_images) <= 1:
-                    logging.error(
-                        f"OOM with single image on {device_name}. "
-                        f"Skipping: {batch_paths[0]}"
-                    )
-                    continue
-
-                # Attempt recovery by processing in smaller chunks
-                chunk_size = max(
-                    1, batch_size // 2
-                )  # Start with half the original size
-                recovery_attempts = 0
-                max_recovery_attempts = 3  # Prevent infinite retries
-
-                while recovery_attempts < max_recovery_attempts:
-                    try:
-                        recovered_outputs = []
-                        logging.warning(
-                            f"Attempting OOM recovery on {device_name} with "
-                            f"chunk_size={chunk_size} (attempt {recovery_attempts + 1})"
-                        )
-
-                        # Process batch in chunks
-                        for i in range(0, len(batch_images), chunk_size):
-                            sub_batch = batch_images[i : i + chunk_size]
-                            sub_outputs = pipeline(sub_batch, batch_size=chunk_size)
-                            recovered_outputs.extend(sub_outputs)
-                            torch.cuda.empty_cache()  # Clear cache between chunks
-
-                        outputs = recovered_outputs
-                        processed_successfully = True
-                        logging.info(
-                            f"Successfully recovered batch on {device_name} "
-                            f"using chunk_size={chunk_size}"
-                        )
-                        break
-
-                    except torch.cuda.OutOfMemoryError:
-                        recovery_attempts += 1
-                        chunk_size = max(1, chunk_size // 2)  # Halve chunk size again
-                        torch.cuda.empty_cache()
-                        if recovery_attempts >= max_recovery_attempts:
-                            logging.error(
-                                f"OOM recovery failed after {max_recovery_attempts} "
-                                f"attempts on {device_name}. Skipping batch."
-                            )
-                            continue
-
-            # Save processed images if successful
-            if processed_successfully and outputs is not None:
-                logging.info(
-                    f"Saving {len(outputs)} processed images from {device_name}"
-                )
-                for path, output in zip(batch_paths, outputs):
-                    output_path = os.path.join(output_dir, os.path.basename(path))
-                    try:
-                        saver.save(output, output_path)
-                        logging.debug(f"Saved image to {output_path}")
-                    except Exception as e:
-                        logging.error(f"Failed to save image {path}: {str(e)}")
-
-        except queue.Empty:
-            logging.warning(f"Queue timeout on {device_name}")
-            continue
         except Exception as e:
-            logging.error(f"Consumer error on {device_name}: {e}")
+            logging.error(f"Consumer loop error on {device_name}: {e}")
             continue
-        finally:
-            image_queue.task_done()
 
     logging.info(f"Consumer on {device_name} shutting down")
 
@@ -209,65 +189,95 @@ def process_images_with_queue(
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Create shared queue
-    image_queue = queue.Queue(maxsize=queue_size)
+    # Initialize Tile Cache (Run-Global Deduplication)
+    tile_cache = RunLocalTileCache()
 
-    # Initialize pipelines on all available GPUs
-    pipelines = []
-    for i in range(torch.cuda.device_count()):
-        device = f"cuda:{i}"
+    try:
+        # Create shared queue
+        image_queue = queue.Queue(maxsize=queue_size)
+
+        # Initialize pipelines on all available GPUs
+        pipelines = []
+        for i in range(torch.cuda.device_count()):
+            device = f"cuda:{i}"
+            try:
+                pipe = pipeline(
+                    "image-to-image",
+                    model=model_id,
+                    device=device,
+                    torch_dtype=torch.float16,
+                )
+                pipelines.append(pipe)
+                logging.info(f"Initialized pipeline on {device}")
+            except Exception as e:
+                logging.error(f"Failed to initialize pipeline on {device}: {e}")
+
+        if not pipelines:
+            # Fallback to CPU if no GPU
+            if torch.cuda.device_count() == 0:
+                logging.warning("No GPU found. Initializing CPU pipeline.")
+                pipe = pipeline("image-to-image", model=model_id, device="cpu")
+                pipelines.append(pipe)
+            else:
+                raise RuntimeError("No pipelines could be initialized")
+
+        # Find optimal batch size using the first pipeline
+        # Note: With tiled processing, the 'image batch size' matters less for OOM,
+        # but matters for deduplication efficiency (larger batch = more chance to dedup).
+        # We can stick to a reasonable default or dynamic calculation.
+        # Since we are tiling, 1 image is actually many tiles.
+        # Let's use a conservative batch size for images to avoid holding too many large images in RAM.
+        dataset = load_image_dataset(image_dir, streaming=True)
         try:
-            pipe = pipeline(
-                "image-to-image",
-                model=model_id,
-                device=device,
-                torch_dtype=torch.float16,
-            )
-            pipelines.append(pipe)
-            logging.info(f"Initialized pipeline on {device}")
-        except Exception as e:
-            logging.error(f"Failed to initialize pipeline on {device}: {e}")
+            first_item = next(iter(dataset))
+            # Just verify we can load images
+            pass
+        except StopIteration:
+            logging.warning("Dataset is empty")
+            return
 
-    if not pipelines:
-        raise RuntimeError("No pipelines could be initialized")
+        # Fixed batch size for image consumption (e.g., 4 images at a time)
+        # Tiling will break them down.
+        batch_sizes = [4] * len(pipelines)
+        logging.info(f"Using batch sizes: {batch_sizes}")
 
-    # Find optimal batch size using the first pipeline
-    dataset = load_image_dataset(image_dir, streaming=True)
-    first_item = next(iter(dataset))
-    batch_sizes = [
-        find_max_batch_size(pipeline, first_item["image"], 1, 5)
-        for pipeline in tqdm(pipelines, desc="finding batch sizes")
-    ]
-    logging.info(f"Using batch sizes: {batch_sizes}")
+        logging.info("Initializing saver thread")
+        saver = async_image_saver(output_dir)
 
-    logging.info("Iitializing saver thread")
-    saver = async_image_saver(output_dir)
-    # Start producer thread
-    logging.info("Initializing producer thread")
-    producer_thread = threading.Thread(target=producer, args=(image_dir, image_queue))
-
-    logging.info("Initializing consumer threads")
-    # Start consumer threads
-    consumer_threads = []
-    for pipe, batch_size in zip(pipelines, batch_sizes):
-        thread = threading.Thread(
-            target=consumer, args=(pipe, image_queue, output_dir, batch_size, saver)
+        # Start producer thread
+        logging.info("Initializing producer thread")
+        producer_thread = threading.Thread(
+            target=producer, args=(image_dir, image_queue)
         )
-        consumer_threads.append(thread)
 
-    # Start all threads
-    producer_thread.start()
-    for thread in consumer_threads:
-        thread.start()
+        logging.info("Initializing consumer threads")
+        # Start consumer threads
+        consumer_threads = []
+        for pipe, batch_size in zip(pipelines, batch_sizes):
+            thread = threading.Thread(
+                target=consumer,
+                args=(pipe, image_queue, output_dir, batch_size, saver, tile_cache),
+            )
+            consumer_threads.append(thread)
 
-    # Wait for completion
-    producer_thread.join()
-    for thread in consumer_threads:
-        thread.join()
+        # Start all threads
+        producer_thread.start()
+        for thread in consumer_threads:
+            thread.start()
 
-    saver.shutdown()
+        # Wait for completion
+        producer_thread.join()
+        for thread in consumer_threads:
+            thread.join()
 
-    logging.info("Image processing completed")
+        saver.shutdown()
+
+        logging.info("Image processing completed")
+
+    finally:
+        # Ensure cache cleanup
+        if tile_cache:
+            tile_cache.cleanup()
 
 
 if __name__ == "__main__":
